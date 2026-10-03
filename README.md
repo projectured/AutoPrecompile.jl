@@ -2,8 +2,8 @@
 
 [![CI](https://github.com/projectured/AutoPrecompile.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/projectured/AutoPrecompile.jl/actions/workflows/CI.yml)
 
-**Status: in development.** It builds, loads and removes images. Nothing of it
-has been measured outside its tests yet.
+**Status: in development.** It builds, loads and removes images, and it is not
+announced yet.
 
 A Julia session compiles much of the code that it runs, and it keeps that code
 only until the process ends. A package can cache compiled code in its own
@@ -14,6 +14,29 @@ session compiles it again.
 
 AutoPrecompile caches that code, once for each set of packages that a session
 loads.
+
+## What it saves
+
+Measured on 2026-10-03 with the packages of ProjecturEd, a projectional editor,
+in the session that their README shows: `using AutoPrecompile, Projectured,
+DataFrames, SimpleDirectMediaLayer`, then `display_in_editor` of a data frame of
+100 000 rows, timed until the window draws its first frame. Julia 1.13, one
+thread, three runs of each session that loads an image or none.
+
+| session | `using` line | first `display_in_editor` | second |
+| --- | ---: | ---: | ---: |
+| without AutoPrecompile | 1.2 s | 27 to 30 s | 0.1 to 2.2 s |
+| the first with AutoPrecompile, which builds the image | 2.5 s | 29 s | 5.6 s |
+| a later one, which loads the image | 2.8 to 3.0 s | 0.3 to 0.4 s | 0.1 to 0.2 s |
+
+- Without the image, nearly all of the first call is compile time. With it, the
+  first call compiles 0.2 s at most.
+- The image holds 8129 statements. It took about 95 s to build in the
+  background, and it takes 127 MB.
+- The `using` line takes about 1.7 s more, because AutoPrecompile reads the
+  statement files and loads the image.
+- The session that builds the image is no faster. Its second call also compiles
+  the code of AutoPrecompile that starts the build.
 
 ## Use
 
