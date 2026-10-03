@@ -3,7 +3,11 @@ uuid = "b272d1c7-21da-44b4-9d4d-f64941f33c6f"
 version = "0.1.0"
 authors = []
 
+[deps]
+UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
+
 [compat]
+UUIDs = "1"
 julia = "1.12"
 
 [extras]
