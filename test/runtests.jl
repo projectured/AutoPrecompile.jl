@@ -42,6 +42,101 @@ const _REFUSED = [
 const _A = Base.PkgId(UUID("10000000-0000-0000-0000-0000000000a1"), "PackageA")
 const _B = Base.PkgId(UUID("10000000-0000-0000-0000-0000000000a2"), "PackageB")
 
+# ── Sessions in a scratch environment ───────────────────────────────────────
+#
+# Each session is a new Julia process in a scratch environment of small packages,
+# which names AutoPrecompile by its folder. It writes its cache files and its
+# scratch space into a scratch depot, and reads installed packages from the depots
+# of this process.
+
+const _SCRATCH_UUIDS = Dict("PackageA" => "20000000-0000-0000-0000-0000000000a1",
+                            "PackageB" => "20000000-0000-0000-0000-0000000000a2",
+                            "PackageC" => "20000000-0000-0000-0000-0000000000a3")
+
+function _write_statements(root, lines)
+    directory = mkpath(joinpath(root, "precompile"))
+    write(joinpath(directory, "scenario.txt"), join(lines, "\n") * "\n")
+end
+
+# A package in `folder` with the dependencies `deps` (scratch packages beside it),
+# `body` in its module, and `statements` in its statement file.
+function _make_scratch_package(folder, name; deps = String[], body = "", statements = nothing)
+    root = joinpath(folder, name)
+    mkpath(joinpath(root, "src"))
+    project = "name = \"$name\"\nuuid = \"$(_SCRATCH_UUIDS[name])\"\nversion = \"0.1.0\"\n"
+    if !isempty(deps)
+        project *= "\n[deps]\n" * join(["$dep = \"$(_SCRATCH_UUIDS[dep])\"\n" for dep in deps])
+        project *= "\n[sources]\n" * join(["$dep = {path = \"../$dep\"}\n" for dep in deps])
+    end
+    write(joinpath(root, "Project.toml"), project)
+    write(joinpath(root, "src", "$name.jl"), "module $name\n$body\nend\n")
+    statements === nothing || _write_statements(root, statements)
+    root
+end
+
+# The depots of this process follow the scratch depot by name: an empty entry in
+# `JULIA_DEPOT_PATH` would add the default depots without the depot of the user,
+# which holds the registry and the installed packages.
+_scratch_environment_variables(depot) =
+    ("JULIA_LOAD_PATH" => "@" * (Sys.iswindows() ? ";" : ":") * "@stdlib",
+     "JULIA_DEPOT_PATH" => join([depot; DEPOT_PATH], Sys.iswindows() ? ";" : ":"),
+     "JULIA_PKG_OFFLINE" => "true", "JULIA_PKG_PRECOMPILE_AUTO" => "0")
+
+# A scratch environment that names AutoPrecompile and three packages. `PackageB`
+# ships a line that would remove `marker` if it were evaluated. It answers the
+# folder of the environment, the folder of the scratch depot, and the folders of
+# the packages.
+function _make_scratch_environment(marker)
+    folder = mktempdir()
+    packages = [
+        _make_scratch_package(folder, "PackageA";
+            body = "struct Thing\n    x::Int\nend\nf(t::Thing) = string(t.x, \"!\")\nf(x::Int) = string(x, \"?\")",
+            statements = ["Tuple{typeof(PackageA.f), PackageA.Thing}"]),
+        _make_scratch_package(folder, "PackageB"; deps = ["PackageA"],
+            body = "import PackageA\ng(t::PackageA.Thing) = PackageA.f(t) * \"!\"",
+            statements = ["# what a scenario compiled",
+                          "Tuple{typeof(PackageB.g), PackageA.Thing}",
+                          "Tuple{typeof(PackageC.h), Int64}",
+                          "Tuple{typeof(rm($(repr(marker))))}"]),
+        _make_scratch_package(folder, "PackageC"; body = "h(x) = x + 1")]
+    environment = mkpath(joinpath(folder, "environment"))
+    depot = mkpath(joinpath(folder, "depot"))
+    paths = [pkgdir(AutoPrecompile); packages]
+    code = "using Pkg; Pkg.develop([PackageSpec(path = path) for path in $(repr(paths))]; io = devnull)"
+    run(addenv(`$(Base.julia_cmd()) --startup-file=no --project=$environment -e $code`,
+               _scratch_environment_variables(depot)...))
+    environment, depot, packages
+end
+
+# Run `code` in a new session of `environment`, with `--trace-compile` into
+# `trace` when it is given, and answer its standard output and standard error.
+function _run_session(environment, depot, code; trace = nothing)
+    flags = trace === nothing ? String[] : ["--trace-compile=$trace"]
+    code = "_is_leaf_name(package) = startswith(package.name, \"AutoPrecompileLeaf_\")\n" * code
+    output = IOBuffer()
+    errors = IOBuffer()
+    command = addenv(`$(Base.julia_cmd()) --startup-file=no $flags --project=$environment -e $code`,
+                     _scratch_environment_variables(depot)...)
+    run(pipeline(command; stdout = output, stderr = errors))
+    String(take!(output)), String(take!(errors))
+end
+
+# The code of a session that loads `packages` with a short wait before a build,
+# waits until the builds that it started end, and prints their exit codes.
+_format_building_session(packages) = """
+    using AutoPrecompile
+    AutoPrecompile._BUILD_WAIT[] = 0.5
+    using $packages
+    deadline = time() + 600
+    while time() < deadline
+        sleep(0.5)
+        builds = lock(() -> collect(values(AutoPrecompile._BUILDS)), AutoPrecompile._STATE_LOCK)
+        AutoPrecompile._BUILD_TIMER[] === nothing && !isempty(builds) &&
+            all(process_exited, builds) && break
+    end
+    print(join([string(process.exitcode) for process in values(AutoPrecompile._BUILDS)], " "))
+    """
+
 @testset "AutoPrecompile" begin
 
 @testset "a package with no folder precompile/ has no statements" begin
@@ -109,8 +204,79 @@ end
     @test Base.isidentifier(name)
 end
 
-@testset "this version adds no package callback when it loads" begin
-    @test !any(callback -> parentmodule(callback) === AutoPrecompile, Base.package_callbacks)
+@testset "AutoPrecompile adds its callback and the folder of its leaves when it loads" begin
+    @test any(callback -> parentmodule(callback) === AutoPrecompile, Base.package_callbacks)
+    @test AutoPrecompile._LEAVES[] in LOAD_PATH
+end
+
+@testset "a session builds the leaf of its packages, and a later session loads it" begin
+    marker = tempname()
+    write(marker, "")
+    environment, depot, packages = _make_scratch_environment(marker)
+    package_a = Base.PkgId(UUID(_SCRATCH_UUIDS["PackageA"]), "PackageA")
+    package_b = Base.PkgId(UUID(_SCRATCH_UUIDS["PackageB"]), "PackageB")
+    leaves = joinpath(depot, "scratchspaces", string(Base.PkgId(AutoPrecompile).uuid), "leaves")
+    leaf_ab = joinpath(leaves, _format_leaf_name(_compute_leaf_uuid([package_a, package_b])))
+    leaf_a = joinpath(leaves, _format_leaf_name(_compute_leaf_uuid([package_a])))
+    call = "print(any(_is_leaf_name, keys(Base.loaded_modules))); PackageB.g(PackageA.Thing(3))"
+
+    # The first session selects two of the four lines, builds their leaf in the
+    # background and says so. The line that calls `rm` is never evaluated.
+    output, errors = _run_session(environment, depot, _format_building_session("PackageA, PackageB"))
+    @test output == "0"
+    @test occursin("AutoPrecompile: compiling 2 statements for PackageA, PackageB in the background",
+                   errors)
+    @test readlines(joinpath(leaf_ab, "statements.txt")) ==
+          ["Tuple{typeof(PackageA.f), PackageA.Thing}", "Tuple{typeof(PackageB.g), PackageA.Thing}"]
+    log = read(joinpath(leaf_ab, "build.log"), String)
+    @test occursin("AutoPrecompile: compiled 2 of 2 statements", log)
+    @test occursin("AutoPrecompile: the image is ready", log)
+    @test isfile(marker)
+
+    # A later session loads the leaf, builds nothing, and does not compile the
+    # statements. Without AutoPrecompile the same call compiles `PackageB.g`, so
+    # the first check means something.
+    trace = joinpath(depot, "with-leaf.txt")
+    output, errors = _run_session(environment, depot, "using AutoPrecompile, PackageA, PackageB; $call";
+                                  trace)
+    @test output == "true"
+    @test !occursin("AutoPrecompile", errors)
+    @test !occursin("PackageB.g", read(trace, String))
+    trace = joinpath(depot, "without-leaf.txt")
+    output, _ = _run_session(environment, depot, "using PackageA, PackageB; $call"; trace)
+    @test output == "false"
+    @test occursin("PackageB.g", read(trace, String))
+
+    # A changed statement file builds the leaf again, and the session after loads it.
+    _write_statements(packages[1], ["Tuple{typeof(PackageA.f), PackageA.Thing}",
+                                    "Tuple{typeof(PackageA.f), Int64}"])
+    output, errors = _run_session(environment, depot, _format_building_session("PackageA, PackageB"))
+    @test output == "0"
+    @test occursin("AutoPrecompile: compiling 3 statements for PackageA, PackageB", errors)
+    output, _ = _run_session(environment, depot, "using AutoPrecompile, PackageA, PackageB; $call")
+    @test output == "true"
+
+    # A package with no statements builds nothing.
+    output, errors = _run_session(environment, depot, """
+        using AutoPrecompile
+        AutoPrecompile._BUILD_WAIT[] = 0.5
+        using PackageC
+        sleep(3)
+        print(isempty(AutoPrecompile._BUILDS))
+        """)
+    @test output == "true"
+    @test !occursin("AutoPrecompile", errors)
+
+    # A session that ends before the wait starts the build as it ends, and the
+    # build goes on after the session.
+    output, errors = _run_session(environment, depot, "using AutoPrecompile, PackageA")
+    @test occursin("AutoPrecompile: compiling 2 statements for PackageA in the background", errors)
+    log = joinpath(leaf_a, "build.log")
+    deadline = time() + 600
+    while time() < deadline && !(isfile(log) && occursin("the image is ready", read(log, String)))
+        sleep(1)
+    end
+    @test occursin("AutoPrecompile: the image is ready", read(log, String))
 end
 
 end
