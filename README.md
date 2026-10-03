@@ -2,8 +2,8 @@
 
 [![CI](https://github.com/projectured/AutoPrecompile.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/projectured/AutoPrecompile.jl/actions/workflows/CI.yml)
 
-**Status: in development.** It builds and loads images, but it does not limit
-the disk space of its images yet.
+**Status: in development.** It builds, loads and removes images. Nothing of it
+has been measured outside its tests yet.
 
 A Julia session compiles much of the code that it runs, and it keeps that code
 only until the process ends. A package can cache compiled code in its own
@@ -70,3 +70,19 @@ the leaf with the images of the other packages.
   and the next build replaces it.
 - A process that writes a cache file does nothing, so no cache file depends on
   the statements.
+
+## Disk space
+
+All images of AutoPrecompile together take at most 2048 MB. Before and after
+each build, it removes the images that a session loaded longest ago until they
+fit, but never an image that the session loaded or one that a build can be
+writing. Set another limit in megabytes in `LocalPreferences.toml` beside the
+`Project.toml` of your environment:
+
+```toml
+[AutoPrecompile]
+disk_limit_mb = 4096
+```
+
+The images live in the scratch space of AutoPrecompile, so `Pkg.gc()` removes
+them when AutoPrecompile is no longer installed.

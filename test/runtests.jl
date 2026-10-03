@@ -204,6 +204,58 @@ end
     @test Base.isidentifier(name)
 end
 
+@testset "the disk limit comes from the preferences, in megabytes" begin
+    get_limit = AutoPrecompile._get_disk_limit
+    @test get_limit(Dict{String,Any}()) == 2048 * 1024^2
+    @test get_limit(Dict{String,Any}("disk_limit_mb" => 100)) == 100 * 1024^2
+    @test get_limit(Dict{String,Any}("disk_limit_mb" => 0)) == 0
+    for value in ("2 GB", -1, 1.5)
+        limit = @test_logs (:warn, r"disk_limit_mb") get_limit(Dict{String,Any}("disk_limit_mb" => value))
+        @test limit == 2048 * 1024^2
+    end
+end
+
+@testset "the leaves loaded longest ago go first, until all fit the limit" begin
+    mktempdir() do depot
+        leaves = mkpath(joinpath(depot, "leaves"))
+        # A leaf with 1000 bytes of images for each of two Julia versions, loaded
+        # `age` seconds ago.
+        function make_leaf(name, age; building = false)
+            folder = mkpath(joinpath(leaves, name))
+            write(joinpath(folder, "statements.txt"), "")
+            write(joinpath(folder, "loaded"), string(time() - age))
+            building && write(joinpath(folder, "build.pid"), "1 host")
+            for version in ("v1.12", "v1.13")
+                images = mkpath(joinpath(depot, "compiled", version, name))
+                write(joinpath(images, "image.so"), zeros(UInt8, 1000))
+            end
+        end
+        make_leaf("AutoPrecompileLeaf_built", 500; building = true)
+        make_leaf("AutoPrecompileLeaf_kept", 400)
+        make_leaf("AutoPrecompileLeaf_old", 300)
+        make_leaf("AutoPrecompileLeaf_middle", 200)
+        make_leaf("AutoPrecompileLeaf_new", 100)
+        mkpath(joinpath(leaves, "Other"))
+        keep = Set(["AutoPrecompileLeaf_kept"])
+
+        # Five leaves of a little more than 2000 bytes each. The two oldest leaves
+        # that may go bring them under 6500 bytes; the one with a build and the
+        # kept one stay, though they are older.
+        removed = AutoPrecompile._remove_old_leaves!(; leaves, depot, limit = 6500, keep)
+        @test removed == ["AutoPrecompileLeaf_old", "AutoPrecompileLeaf_middle"]
+        for name in removed, folder in (joinpath(leaves, name),
+                                        joinpath(depot, "compiled", "v1.12", name),
+                                        joinpath(depot, "compiled", "v1.13", name))
+            @test !isdir(folder)
+        end
+        for name in ("AutoPrecompileLeaf_built", "AutoPrecompileLeaf_kept",
+                     "AutoPrecompileLeaf_new", "Other")
+            @test isdir(joinpath(leaves, name))
+        end
+        @test AutoPrecompile._remove_old_leaves!(; leaves, depot, limit = 6500, keep) == String[]
+    end
+end
+
 @testset "AutoPrecompile adds its callback and the folder of its leaves when it loads" begin
     @test any(callback -> parentmodule(callback) === AutoPrecompile, Base.package_callbacks)
     @test AutoPrecompile._LEAVES[] in LOAD_PATH
@@ -242,17 +294,25 @@ end
     @test output == "true"
     @test !occursin("AutoPrecompile", errors)
     @test !occursin("PackageB.g", read(trace, String))
+    @test isfile(joinpath(leaf_ab, "loaded"))
     trace = joinpath(depot, "without-leaf.txt")
     output, _ = _run_session(environment, depot, "using PackageA, PackageB; $call"; trace)
     @test output == "false"
     @test occursin("PackageB.g", read(trace, String))
 
     # A changed statement file builds the leaf again, and the session after loads it.
+    # The build removes the old images of the leaf first, such as one that Julia
+    # wrote for other flags.
+    images = joinpath(depot, "compiled", "v$(VERSION.major).$(VERSION.minor)", basename(leaf_ab))
+    stale = joinpath(images, "stale.ji")
+    write(stale, "")
     _write_statements(packages[1], ["Tuple{typeof(PackageA.f), PackageA.Thing}",
                                     "Tuple{typeof(PackageA.f), Int64}"])
     output, errors = _run_session(environment, depot, _format_building_session("PackageA, PackageB"))
     @test output == "0"
     @test occursin("AutoPrecompile: compiling 3 statements for PackageA, PackageB", errors)
+    @test !isfile(stale)
+    @test count(endswith(".ji"), readdir(images)) == 1
     output, _ = _run_session(environment, depot, "using AutoPrecompile, PackageA, PackageB; $call")
     @test output == "true"
 

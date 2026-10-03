@@ -25,7 +25,11 @@ A line that does not have the shape of a signature is never evaluated. A process
 that writes a cache file does nothing, so no cache file depends on the
 statements.
 
-This version does not limit the disk space of its leaves yet.
+All leaves together take at most 2048 MB, or the number of megabytes that the
+entry `disk_limit_mb` of the table `[AutoPrecompile]` in `LocalPreferences.toml`
+gives. Before and after each build, AutoPrecompile removes the leaves that a
+session loaded longest ago until they fit, but never a leaf that this session
+loaded or a leaf that a build can be writing.
 """
 module AutoPrecompile
 
@@ -407,11 +411,121 @@ function _replay_statements!(statements, scope::Module)
     (compiled = compiled, skipped = total - compiled, total = total)
 end
 
+# ── Disk space ──────────────────────────────────────────────────────────────
+
+# The limit of the disk space of all leaves together, in megabytes, when the
+# preferences give none.
+const _DEFAULT_DISK_LIMIT_MB = 2048
+
+"""
+    _get_disk_limit(preferences = Base.get_preferences(uuid of AutoPrecompile)) -> Int
+
+The limit of the disk space of all leaves together, in bytes. The entry
+`disk_limit_mb` of the table `[AutoPrecompile]` in `LocalPreferences.toml` gives
+it in megabytes; a value that is not a whole number of zero or more gives a
+warning and the default, 2048.
+"""
+function _get_disk_limit(preferences = Base.get_preferences(_AUTOPRECOMPILE.uuid))
+    value = get(preferences, "disk_limit_mb", _DEFAULT_DISK_LIMIT_MB)
+    if !(value isa Integer) || value < 0
+        @warn "AutoPrecompile: disk_limit_mb in LocalPreferences.toml is a whole number of megabytes, not $(repr(value)); the limit is $_DEFAULT_DISK_LIMIT_MB MB"
+        value = _DEFAULT_DISK_LIMIT_MB
+    end
+    value * 1024^2
+end
+
+# The folders that the leaf `name` takes: its folder in `leaves`, and its images
+# for each Julia version in the depot `depot`.
+function _collect_leaf_folders(name, leaves, depot)
+    folders = [joinpath(leaves, name)]
+    compiled = joinpath(depot, "compiled")
+    if isdir(compiled)
+        for version in readdir(compiled)
+            folder = joinpath(compiled, version, name)
+            isdir(folder) && push!(folders, folder)
+        end
+    end
+    folders
+end
+
+# The bytes of the files under `path`.
+function _measure_size(path)
+    isfile(path) && return filesize(path)
+    isdir(path) || return 0
+    total = 0
+    for (root, _, files) in walkdir(path)
+        for file in files
+            total += filesize(joinpath(root, file))
+        end
+    end
+    total
+end
+
+# Record that this session loaded the leaf in `folder`. The time is the text of
+# the file, so that a test can write any time.
+_mark_leaf_loaded(folder) = write(joinpath(folder, "loaded"), string(time()))
+
+# When a session last loaded the leaf in `folder`, else when it was written.
+function _get_last_use(folder)
+    loaded = joinpath(folder, "loaded")
+    if isfile(loaded)
+        value = tryparse(Float64, read(loaded, String))
+        value === nothing || return value
+    end
+    statements = joinpath(folder, "statements.txt")
+    isfile(statements) ? mtime(statements) : 0.0
+end
+
+# Whether a build of the leaf in `folder` can run: its pidfile is younger than an
+# hour. A pidfile that a build left behind when it was killed counts until then.
+function _is_build_running(folder)
+    pidfile = joinpath(folder, "build.pid")
+    isfile(pidfile) && time() - mtime(pidfile) < 3600
+end
+
+# The leaves that a cleanup keeps: `name`, and each leaf that this session loaded.
+_collect_kept_leaves(name) =
+    Set([name; [package.name for (package, _) in _collect_loaded_modules() if _is_leaf(package)]])
+
+"""
+    _remove_old_leaves!(; leaves, depot, limit, keep) -> Vector{String}
+
+Remove leaves, the one that a session loaded longest ago first, until all leaves
+in `leaves` with their images in `depot` take at most `limit` bytes. A leaf named
+in `keep`, or with a build that can run, stays. Answers the names of the removed
+leaves.
+"""
+function _remove_old_leaves!(; leaves = _LEAVES[], depot = first(DEPOT_PATH),
+                             limit = _get_disk_limit(), keep = Set{String}())
+    isdir(leaves) || return String[]
+    entries = Tuple{String,Float64,Int}[]
+    for name in readdir(leaves)
+        (startswith(name, _LEAF_PREFIX) && isdir(joinpath(leaves, name))) || continue
+        size = sum(_measure_size, _collect_leaf_folders(name, leaves, depot))
+        push!(entries, (name, _get_last_use(joinpath(leaves, name)), size))
+    end
+    total = sum(entry -> entry[3], entries; init = 0)
+    removed = String[]
+    for (name, _, size) in sort!(entries; by = entry -> entry[2])
+        total <= limit && break
+        (name in keep || _is_build_running(joinpath(leaves, name))) && continue
+        foreach(folder -> rm(folder; recursive = true, force = true),
+                _collect_leaf_folders(name, leaves, depot))
+        total -= size
+        push!(removed, name)
+    end
+    isempty(removed) ||
+        @info "AutoPrecompile: removed $(length(removed)) leaves that no session loaded for the longest time, to stay within $(limit ÷ 1024^2) MB"
+    removed
+end
+
 # ── The build ───────────────────────────────────────────────────────────────
 
 # The command that builds the image of `leaf` in a process of its own, with the
 # load path and the depots of this session. A pidfile lock lets one process
-# build a leaf at a time; the next one finds the image valid and stops.
+# build a leaf at a time; the next one finds the image valid and stops. Under the
+# lock, the old images of the leaf for this Julia version go first, because
+# Julia keeps an old image beside a new one.
 function _make_build_command(leaf::_Leaf)
     separator = Sys.iswindows() ? ";" : ":"
     code = """
@@ -419,6 +533,9 @@ function _make_build_command(leaf::_Leaf)
         leaf = Base.PkgId(Base.UUID("$(leaf.id.uuid)"), "$(leaf.id.name)")
         mkpidlock($(repr(joinpath(leaf.folder, "build.pid")))) do
             if !Base.isprecompiled(leaf)
+                images = joinpath(first(DEPOT_PATH), "compiled",
+                                  "v\$(VERSION.major).\$(VERSION.minor)", leaf.name)
+                rm(images; recursive = true, force = true)
                 result = Base.compilecache(leaf)
                 result isa Exception && throw(result)
             end
@@ -442,6 +559,7 @@ end
 function _start_build!(leaf::_Leaf)
     names = join(sort!([package.name for package in leaf.set]), ", ")
     log = _get_build_log(leaf)
+    _remove_old_leaves!(keep = _collect_kept_leaves(leaf.id.name))
     @info "AutoPrecompile: compiling $(length(leaf.statements)) statements for $names in the background; the next session that loads these packages uses the result" log
     process = open(log, "w") do io
         run(pipeline(_make_build_command(leaf); stdin = devnull, stdout = io, stderr = io);
@@ -451,6 +569,9 @@ function _start_build!(leaf::_Leaf)
     errormonitor(@async begin
         if success(process)
             @info "AutoPrecompile: the image for $names is ready"
+            _run_guarded("the removal of old leaves") do
+                _remove_old_leaves!(keep = _collect_kept_leaves(leaf.id.name))
+            end
         else
             @warn "AutoPrecompile: the build for $names failed" log
         end
@@ -526,6 +647,7 @@ function _load_or_schedule!()
     if _is_leaf_written(leaf) && Base.isprecompiled(leaf.id)
         _cancel_build_wait!()
         Base.require(leaf.id)
+        _mark_leaf_loaded(leaf.folder)
     else
         _schedule_build!()
     end
