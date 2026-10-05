@@ -18,7 +18,8 @@ loads.
 ## What it saves
 
 Measured on 2026-10-03 with the packages of ProjecturEd, a projectional editor,
-in the session that their README shows: `using AutoPrecompile, Projectured,
+in the session that [their README](https://github.com/projectured/Projectured.jl)
+shows: `using AutoPrecompile, Projectured,
 DataFrames, SimpleDirectMediaLayer`, then `display_in_editor` of a data frame of
 100 000 rows, timed until the window draws its first frame. Julia 1.13, one
 thread, three runs of each session that loads an image or none.
@@ -37,6 +38,19 @@ thread, three runs of each session that loads an image or none.
   statement files and loads the image.
 - The session that builds the image is no faster. Its second call also compiles
   the code of AutoPrecompile that starts the build.
+
+## Install
+
+AutoPrecompile is in the registry
+[`ProjecturedRegistry`](https://github.com/projectured/ProjecturedRegistry), not in
+the General registry. Add both registries once; if General is there already, its
+line does nothing:
+
+```
+pkg> registry add General
+pkg> registry add https://github.com/projectured/ProjecturedRegistry
+pkg> add AutoPrecompile
+```
 
 ## Use
 
@@ -109,3 +123,7 @@ disk_limit_mb = 4096
 
 The images live in the scratch space of AutoPrecompile, so `Pkg.gc()` removes
 them when AutoPrecompile is no longer installed.
+
+## Licence
+
+MIT, in [`LICENSE`](LICENSE).
