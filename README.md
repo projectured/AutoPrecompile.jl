@@ -2,8 +2,8 @@
 
 [![CI](https://github.com/projectured/AutoPrecompile.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/projectured/AutoPrecompile.jl/actions/workflows/CI.yml)
 
-**Status: in development.** It builds, loads and removes images, and it is not
-announced yet.
+**Status: 0.1.0, an early release.** It builds, loads and removes images.
+Problem reports and questions are welcome as GitHub issues.
 
 A Julia session compiles much of the code that it runs, and it keeps that code
 only until the process ends. A package can cache compiled code in its own
