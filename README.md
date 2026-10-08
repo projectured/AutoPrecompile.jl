@@ -3,17 +3,22 @@
 [![CI](https://github.com/projectured/AutoPrecompile.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/projectured/AutoPrecompile.jl/actions/workflows/CI.yml)
 
 **Status: 0.1.0, an early release.** It builds, loads and removes images.
-Problem reports and questions are welcome as GitHub issues.
+ProjecturEd does not need it: since its release 0.1.1, each of its packages
+compiles its own first window into its package image. Problem reports and
+questions are welcome as GitHub issues.
 
 A Julia session compiles much of the code that it runs, and it keeps that code
-only until the process ends. A package can cache compiled code in its own
-package image with a precompile workload, but that workload holds only what the
-package itself runs. Code that joins several packages, such as a table view of a
-data frame drawn in a native window, belongs to no single package, so each new
-session compiles it again.
+only until the process ends. A package can cache compiled code in its package
+image with a `PrecompileTools` workload. The image holds all code that the
+workload runs, also methods of other packages. But a workload can run only the
+code of its package and of the packages that it depends on, and a package that a
+session loads later can invalidate that code. Code that joins packages that do
+not depend on each other needs a package or an extension that depends on all of
+them, with a workload of its own: one for each combination that users load.
 
-AutoPrecompile caches that code, once for each set of packages that a session
-loads.
+AutoPrecompile makes that package for you: one leaf for each set of packages
+that a session loads, built after the session loaded them, so no package of the
+set can invalidate it.
 
 ## What it saves
 
@@ -22,7 +27,10 @@ in the session that [their README](https://github.com/projectured/Projectured.jl
 shows: `using AutoPrecompile, Projectured,
 DataFrames, SimpleDirectMediaLayer`, then `display_in_editor` of a data frame of
 100 000 rows, timed until the window draws its first frame. Julia 1.13, one
-thread, three runs of each session that loads an image or none.
+thread, three runs of each session that loads an image or none. The packages of
+ProjecturEd had no workloads of their own then, so the session without
+AutoPrecompile compiles all of their code. With their own workloads, since
+ProjecturEd 0.1.1, that first frame takes about 0.75 s without AutoPrecompile.
 
 | session | `using` line | first `display_in_editor` | second |
 | --- | ---: | ---: | ---: |
